@@ -39,11 +39,23 @@ inflow_initial = round.(INITIAL_INFLOWS, digits=0)
 stored_ub = storedEnergy_ub               # 4-vector
 hydro_gen_ub = hydro_ub                      # 4-vector
 
-# Thermal
-N_UNITS = [43, 17, 33, 2]     # units per subsystem
-N_THERMAL_TOTAL = 95           # total units
-thermal_unit_ub/lb/cost        # 95-element flat vectors
-thermal_idx                    # index ranges per subsystem
+# Thermal: per-unit bounds and costs from data.jl
+# thermal_ub[i], thermal_lb[i], thermal_obj[i] are vectors for subsystem i
+# n_units[i] = number of thermal units in subsystem i
+const N_UNITS = [length(thermal_ub[i]) for i in 1:4]   # [43, 17, 33, 2]
+const N_THERMAL_TOTAL = sum(N_UNITS)                     # 95
+
+# flat vectors of per-unit bounds and costs (ordered SE units, then S, NE, N)
+thermal_unit_ub = vcat([vec(thermal_ub[i]) for i in 1:4]...)   # 95-vector
+thermal_unit_lb = vcat([vec(thermal_lb[i]) for i in 1:4]...)   # 95-vector
+thermal_unit_cost = vcat([vec(thermal_obj[i]) for i in 1:4]...)   # 95-vector
+
+# index ranges for each subsystem in the flat thermal vector
+thermal_idx = [sum(N_UNITS[1:i-1])+1:sum(N_UNITS[1:i]) for i in 1:4]
+# thermal_idx[1] = 1:43  (SE)
+# thermal_idx[2] = 44:60 (S)
+# thermal_idx[3] = 61:93 (NE)
+# thermal_idx[4] = 94:95 (N)
 
 # Demand: 12×4 matrix (month × subsystem)
 demand_mat = reduce(vcat, demand)               # 12×4
@@ -97,7 +109,8 @@ function HydrothermalEnv(horizon=T_HORIZON; seed=nothing)
 end
 
 obs_dim() = 2 * N_SYSTEMS            # stored(4) + inflow(4) = 8
-act_dim() = 3 * N_SYSTEMS + 5 * 5   # hydro(4) + thermal(4) + spill(4) + exchange(25) = 37
+act_dim() = N_SYSTEMS + N_THERMAL_TOTAL + N_SYSTEMS + 5 * 5
+# hydro(4) + thermal(95) + spill(4) + exchange(25) = 128
 
 function get_obs(env::HydrothermalEnv)
     # Normalise to ~[0,1] so the network sees consistent scale
@@ -129,9 +142,15 @@ function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
     avail_water = env.stored .+ env.inflow
     hydro_gen = Float64.(a[1:4]) .* min.(hydro_gen_ub, avail_water)
 
-    # Thermal: bounded by aggregate lb/ub (mirrors thermal_gen bounds)
-    thermal_gen = thermal_agg_lb .+
-                  Float64.(a[5:8]) .* (thermal_agg_ub .- thermal_agg_lb)
+    # Thermal: per-unit dispatch (mirrors SDDP exactly)
+    # a[5:99] → 95 values, one per thermal unit
+    # each unit scaled between its own lb and ub
+    thermal_raw = Float64.(a[5:4+N_THERMAL_TOTAL])
+    thermal_units = thermal_unit_lb .+ thermal_raw .* (thermal_unit_ub .- thermal_unit_lb)
+
+    # aggregate generation and cost per subsystem
+    thermal_gen = [sum(thermal_units[thermal_idx[i]]) for i in 1:4]  # MW per subsystem
+    thermal_cost = dot(thermal_unit_cost, thermal_units)               # exact per-unit cost
 
     # Spill: up to 10% of current storage
     spill = Float64.(a[9:12]) .* env.stored .* 0.1
@@ -179,7 +198,7 @@ function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
     end
 
     # ── Cost (same objective terms as sddp_ts.jl) ─────────────────
-    thermal_cost = dot(thermal_avg_cost, thermal_gen)
+    # thermal_cost already computed above as dot(thermal_unit_cost, thermal_units)
     deficit_cost = dot(deficit_obj_vec, deficit)
     spill_cost_val = SPILL_COST * sum(spill)
     total_cost = thermal_cost + deficit_cost + spill_cost_val
