@@ -8,27 +8,29 @@ using LinearAlgebra
 using Plots
 using Random
 
-gamma = Matrix(CSV.read("data/gamma.csv", DataFrame))[:,2:end]
+include("save_results_sddp.jl")
+
+gamma = Matrix(CSV.read("../data/gamma.csv", DataFrame))[:,2:end]
 
 # Read sigma matrices
 sigma = Vector{Matrix{Float64}}(undef, 12)
 for i in 0:11
-    df = CSV.read("data/sigma_$i.csv", DataFrame)
+    df = CSV.read("../data/sigma_$i.csv", DataFrame)
     sigma[i+1] = Matrix(df[:,2:end])  # Remove first column if it's index
 end
 
-exp_mu = Matrix(CSV.read("data/exp_mu.csv", DataFrame))[:,2:end]
+exp_mu = Matrix(CSV.read("../data/exp_mu.csv", DataFrame))[:,2:end]
 
-hydro_ = CSV.read("data/hydro.csv", DataFrame)
-demand = Matrix(CSV.read("data/demand.csv", DataFrame))[:,2:end]
-deficit_ = CSV.read("data/deficit.csv", DataFrame)
-exchange_ub = Matrix(CSV.read("data/exchange.csv", DataFrame))[:,2:end]
-exchange_cost = Matrix(CSV.read("data/exchange_cost.csv", DataFrame))[:,2:end]
+hydro_ = CSV.read("../data/hydro.csv", DataFrame)
+demand = Matrix(CSV.read("../data/demand.csv", DataFrame))[:,2:end]
+deficit_ = CSV.read("../data/deficit.csv", DataFrame)
+exchange_ub = Matrix(CSV.read("../data/exchange.csv", DataFrame))[:,2:end]
+exchange_cost = Matrix(CSV.read("../data/exchange_cost.csv", DataFrame))[:,2:end]
 
 # Read thermal data
 thermal = Vector{DataFrame}(undef, 4)
 for i in 0:3
-    thermal[i+1] = CSV.read("data/thermal_$i.csv", DataFrame)[:,2:end]
+    thermal[i+1] = CSV.read("../data/thermal_$i.csv", DataFrame)[:,2:end]
 end
 
 stored_initial = hydro_.INITIAL[1:4]
@@ -183,3 +185,5 @@ SDDP.train(model,
 simulations = SDDP.simulate(model,
     100
 )
+
+save_results_sddp(simulations, "output/simulations/sddp_train/ts/"; thermal=thermal, save_individual=true)

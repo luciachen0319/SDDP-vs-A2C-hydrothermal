@@ -15,6 +15,18 @@ include("read_data_sddp.jl")
 const T = 24
 #const scaling_factor = 1e-3
 
+# Call the function and unpack the returned NamedTuple
+data = read_data_sddp("train")
+hydro_ = data.hydro_
+demand = data.demand
+deficit_ = data.deficit_
+exchange_ub = data.exchange_ub
+exchange_cost = data.exchange_cost
+stored_initial = data.stored_initial
+inflow_initial = data.inflow_initial
+thermal = data.thermal
+Markov_states = data.Markov_states
+transition_matrix = data.transition_matrix
 
 function analyze_coefficients(subproblem, t)
     # Analyze objective coefficients
@@ -154,4 +166,4 @@ simulations = SDDP.simulate(
 )
 
 # Save both individual and average results
-save_simulation_results(simulations, "output/simulations/sddp_train/")
+save_results_sddp(simulations, "output/simulations/sddp_train/mc/"; thermal=thermal, save_individual=true)
