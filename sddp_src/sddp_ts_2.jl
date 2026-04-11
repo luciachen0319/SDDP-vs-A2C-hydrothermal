@@ -155,7 +155,7 @@ end
 # ── Training ───────────────────────────────────────────────────────────────────
 
 SDDP.train(model,
-    iteration_limit=100,
+    iteration_limit=500,
     print_level=1,
     log_frequency=1,
     stopping_rules=[SDDP.BoundStalling(5, 1e-4)],
@@ -176,14 +176,14 @@ scenarios_inflow, scenarios_omega = generate_eval_scenarios(
 # Stage 1 is deterministic; stages 2..T carry noise (omega_seq has T-1 entries)
 historical = SDDP.Historical(
     [
-        [(t + 1, scenarios_omega[s][t]) for t in 1:(T - 1)]
-        for s in 1:N_EVAL
-    ]
+    [(t + 1, scenarios_omega[s][t]) for t in 1:(T-1)]
+    for s in 1:N_EVAL
+]
 )
 
 simulations = SDDP.simulate(model, N_EVAL,
     [:thermal_cost, :deficit_cost, :spill_cost];
-    sampling_scheme = historical)
+    sampling_scheme=historical)
 
 # Extract total cost per simulation
 sim_costs = [

@@ -96,27 +96,10 @@ function HydrothermalEnv(horizon=T_HORIZON; seed=nothing)
     HydrothermalEnv(0, copy(stored_initial), copy(inflow_initial), rng, horizon)
 end
 
-# # Observation: month(1) + stored_norm(4) + inflow_norm(4) = 9
-# obs_dim() = 1 + N_SYSTEMS + N_SYSTEMS
-
 obs_dim() = 1 + N_SYSTEMS + N_SYSTEMS + N_SYSTEMS # Month + Storage + Inflow + Demand
 
 # Action: hydro(4) + spill(4) + exchange(25) = 33
 act_dim() = N_SYSTEMS + N_SYSTEMS + 25
-
-
-# function get_obs(env::HydrothermalEnv)
-#     # 1. Normalize time (Month 1 to 12 -> 0.08 to 1.0)
-#     month_norm = Float32[mod1(env.t, 12)/12.0]
-
-#     # 2. Normalize storage (0 to stored_ub -> 0.0 to 1.0)
-#     stored_norm = Float32.(env.stored ./ stored_ub)
-
-#     # 3. Normalize inflow (divide by a safe physical upper bound, e.g., 100,000 MW)
-#     inflow_norm = Float32.(env.inflow ./ 100000.0)
-
-#     return vcat(month_norm, stored_norm, inflow_norm)
-# end
 
 # 2. Update the get_obs function:
 function get_obs(env::HydrothermalEnv)
@@ -165,10 +148,6 @@ function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
 
     # 🔥 SHIFTED SIGMOIDS: Injecting domain knowledge into the NN 🔥
     a_hydro = sigmoid.(raw_action[1:4] .+ 3.0f0)  # Defaults to 95% (Keep lights on)
-    a_exch = sigmoid.(raw_action[9:33] .- 3.0f0) # Defaults to 4% (Isolate regions initially)
-
-
-    #a = sigmoid.(raw_action)
     a = sigmoid.(raw_action .* 3.0f0)
 
     # 1. ── Initial Exchange Mapping ──
@@ -199,7 +178,6 @@ function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
 
     # 4. ── Hydro Generation ──
     avail_water = env.stored .+ env.inflow
-    #hydro_gen = Float64.(a[1:4]) .* min.(hydro_gen_ub, avail_water, max.(0.0, target_load))
     hydro_gen = Float64.(a_hydro) .* min.(hydro_gen_ub, avail_water, max.(0.0, target_load))
 
     # 5. ── THERMAL & DEFICIT (Pure Merit Order - Cost Tracking) ──
@@ -331,7 +309,7 @@ end
 
 const GAMMA = 0.99f0
 const LR = 3f-4
-const N_STEPS = 12       # one full seasonal cycle per update
+const N_STEPS = 12      # one full seasonal cycle per update
 const N_EPISODES = 50_000
 
 function train_a2c(; seed=42, n_episodes=N_EPISODES)
@@ -363,10 +341,10 @@ function train_a2c(; seed=42, n_episodes=N_EPISODES)
 
                 next_obs, rew, done, cost = env_step!(env, a)
                 ep_cost += cost
-                rew_scaled = rew / 100.0f0
+
                 push!(obs_buf, obs)
                 push!(act_buf, a)
-                push!(rew_buf, rew_scaled)
+                push!(rew_buf, rew / 100.0f0)
                 push!(val_buf, v)
                 push!(done_buf, done)
                 obs = next_obs
@@ -443,14 +421,15 @@ function evaluate_detailed(agent; n_episodes=5, seed=100)
 
         while !done
             μ = agent.actor(obs)
-            #a = sigmoid.(μ)
+            month = mod1(env.t + 1, 12)
+            demand_t = demand_mat[month, :]
+
             a = sigmoid.(μ .* 3.0f0)
             month = mod1(env.t + 1, 12)
             demand_t = demand_mat[month, :]
 
             # 🔥 SHIFTED SIGMOIDS (For Evaluation) 🔥
             a_hydro = sigmoid.(μ[1:4] .+ 3.0f0)
-            a_exch = sigmoid.(μ[9:33] .- 3.0f0)
 
             # 1. ── EXACT HUB BALANCE MATH ──
             exch = reshape(Float64.(a[9:33]), 5, 5) .* exchange_ub_mat
