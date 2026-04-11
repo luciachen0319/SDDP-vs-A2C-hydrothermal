@@ -266,6 +266,9 @@ end
 const OBS_DIM = obs_dim()
 const ACT_DIM = act_dim()
 
+# Custom initialization function for the final actor layer
+small_init(out, in) = 0.01f0 .* randn(Float32, out, in)
+
 struct A2CAgent
     actor::Chain
     critic::Chain
@@ -274,12 +277,18 @@ end
 Flux.@functor A2CAgent (actor, critic, log_std)
 
 function A2CAgent()
-    actor = Chain(Dense(OBS_DIM => 64, tanh),
+    actor = Chain(
+        Dense(OBS_DIM => 64, tanh),
         Dense(64 => 64, tanh),
-        Dense(64 => ACT_DIM))
-    critic = Chain(Dense(OBS_DIM => 64, tanh),
+        Dense(64 => ACT_DIM, init=small_init) # <--- Small weights applied here!
+    )
+
+    critic = Chain(
+        Dense(OBS_DIM => 64, tanh),
         Dense(64 => 64, tanh),
-        Dense(64 => 1))
+        Dense(64 => 1)
+    )
+
     A2CAgent(actor, critic, zeros(Float32, ACT_DIM))
 end
 
