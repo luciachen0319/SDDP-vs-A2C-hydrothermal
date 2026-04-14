@@ -148,7 +148,7 @@ model = SDDP.MarkovianPolicyGraph(
 end
 
 SDDP.train(model, 
-    iteration_limit=40,
+    iteration_limit=100,
     print_level=1,
     log_frequency=1,
     stopping_rules = [

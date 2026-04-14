@@ -37,23 +37,42 @@ stored_initial = hydro_.INITIAL[1:4]
 inflow_initial = round.(hydro_.INITIAL[5:8],digits=0)
 
 # Create noise sampler
+# TODO
 function create_sampler(t, sigma, gamma, exp_mu)
+    # Pre-calculate the standard deviations for the current month
+    # sigma is a covariance matrix, so the standard deviations are the sqrt of the diagonal
+    std_devs = sqrt.(diag(sigma[mod1(t, 12)]))
+    
     function sample_noise(rng::AbstractRNG)
-        d = MvNormal(zeros(4), sigma[mod1(t,12)])
-        noise = exp.(rand(rng, d))
+        # 1. Define the multivariate normal distribution (mean = 0)
+        d = MvNormal(zeros(4), sigma[mod1(t, 12)])
         
-        coef = -noise .* gamma[mod1(t,12),:] .* 
-               exp_mu[mod1(t,12),:] ./ exp_mu[mod1(t-1,12),:]
+        # 2. Draw the raw statistical noise
+        raw_noise = rand(rng, d)
         
-        rhs = noise .* (1 .- gamma[mod1(t,12),:]) .* 
-              exp_mu[mod1(t,12),:]
+        # 3. CLAMP THE RAW NOISE: bound it strictly to ± 3 standard deviations
+        clamped_noise = clamp.(raw_noise, -3 .* std_devs, 3 .* std_devs)
+        
+        # 4. Exponentiate the safely bounded noise
+        noise = exp.(clamped_noise)
+        
+        # 5. Calculate the PAR(1) affine terms
+        coef = -noise .* gamma[mod1(t,12),:] .* exp_mu[mod1(t,12),:] ./ exp_mu[mod1(t-1,12),:]
+        
+        rhs = noise .* (1 .- gamma[mod1(t,12),:]) .* exp_mu[mod1(t,12),:]
         
         return vcat(coef, rhs)
     end
+    
     return sample_noise
 end
     
 T = 24
+
+# for bounding the inflow variables to avoid infinite space
+# this is set to be at least 10x the initial inflow values
+MAX_INFLOW = [1000000.0, 1000000.0, 1000000.0, 1000000.0] 
+# TODO
 
 model = SDDP.LinearPolicyGraph(
     stages = T,
@@ -67,7 +86,7 @@ model = SDDP.LinearPolicyGraph(
     stored[i=1:4], (SDDP.State, initial_value = stored_initial[i], 
                     lower_bound = 0, upper_bound = hydro_[i,"UB"])
     inflow[i=1:4], (SDDP.State, initial_value = inflow_initial[i],
-                    lower_bound = 0)
+                    lower_bound = 0, upper_bound = MAX_INFLOW[i])
     end)
     
     # Control variables  
@@ -120,8 +139,12 @@ model = SDDP.LinearPolicyGraph(
     # Markov chain for inflows
     if t == 1  # First stage
         for i in 1:4
-            @constraint(sp, inflow[i].in == inflow_initial[i])
-            @constraint(sp, stored[i].in == stored_initial[i])
+            # In SDDP.jl, when declaring an SDDP.State with an initial_value
+            # the package automatically constraints the incoming state (.in) 
+            # to that value in the first stage
+            #@constraint(sp, inflow[i].in == inflow_initial[i])
+            #@constraint(sp, stored[i].in == stored_initial[i])
+            @constraint(sp, inflow[i].out == inflow_initial[i])
         end
     else  # Other stages
         # Create base constraints
@@ -137,8 +160,7 @@ model = SDDP.LinearPolicyGraph(
         for i in 1:n_samples
             support_points[i] = sampler(rng)
         end
-        # Remove any extreme values and ensure finite numbers
-        support_points = [clamp.(point, -1e6, 1e6) for point in support_points]
+
         support_points = [round.(point, digits=4) for point in support_points]
 
         # Apply uncertainty
@@ -171,19 +193,31 @@ model = SDDP.LinearPolicyGraph(
 end
 
 SDDP.train(model, 
-    iteration_limit=100,
+    iteration_limit=1000,
     print_level=1,
     log_frequency=1,
     stopping_rules = [
-        SDDP.BoundStalling(5, 1e-4)  # Stop if bound doesn't improve by 1e-4 in 5 iterations
+        SDDP.BoundStalling(20, 1e-4)  # Stop if bound doesn't improve by 1e-4 in 20 iterations
     ],
     risk_measure = SDDP.Expectation(),
     #dashboard = true
 )
 
 # Simulate policy
-simulations = SDDP.simulate(model,
-    100
+simulations = SDDP.simulate(
+    model, 
+    500,
+    [
+        :thermal_cost, :deficit_cost, :spill_cost,
+        :stored, :spill, :hydro_gen, :deficit, :exchange, :thermal_gen, :inflow
+    ]; 
+    # sampling_scheme = historical
 )
 
-save_results_sddp(simulations, "output/simulations/sddp_train/ts/"; thermal=thermal, save_individual=true)
+costs = [sum(stage[:stage_objective] for stage in sim) for sim in simulations]
+true_mean_cost = sum(costs) / length(costs)
+
+println("Final Lower Bound: ", SDDP.calculate_bound(model))
+println("True Expected Simulation Cost: ", true_mean_cost)
+
+save_results_sddp(simulations, "../output/simulations/sddp_train/ts/"; thermal=thermal, save_individual=true)

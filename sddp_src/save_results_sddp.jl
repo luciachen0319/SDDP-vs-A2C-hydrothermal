@@ -162,7 +162,7 @@ function save_results_sddp(simulations, output_dir; thermal, save_individual=tru
             
             # Process inflow
             if haskey(stage_data, :inflow)
-                values = [stage_data[:inflow][i] for i in 1:4]
+                values = [stage_data[:inflow][i].out for i in 1:4]
                 inflow_sum[:, stage_idx] .+= values
                 if save_individual
                     CSV.write(
