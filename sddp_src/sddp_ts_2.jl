@@ -165,7 +165,7 @@ SDDP.train(model,
 # ── Evaluation on shared scenarios ────────────────────────────────────────────
 
 const N_EVAL = 100    # number of evaluation scenarios
-const EVAL_SEED = 100    # fixed seed — same as A2C evaluate()
+const EVAL_SEED = 200    # fixed seed — same as A2C evaluate()
 
 scenarios_inflow, scenarios_omega = generate_eval_scenarios(
     N_EVAL, T, gamma_mat, sigma_mats, exp_mu_mat, inflow_initial_sddp;

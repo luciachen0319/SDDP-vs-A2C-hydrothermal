@@ -60,7 +60,12 @@ deficit_obj_vec = deficit_obj   # [1142.8, 2465.4, 5152.46, 5845.54]
 deficit_ub_frac = deficit_ub    # [0.05, 0.05, 0.1, 0.8] used as subsystem caps
 
 # Exchange
-exchange_ub_mat = reduce(vcat, exchange_ub)   # 5×5
+exchange_ub_mat = reduce(vcat, exchange_ub)   # 5×5 upper bounds
+exchange_cost_mat = [0.0 0.001 0.001 0.001 0.0005;   # from exchange_cost.csv
+    0.001 0.0 0.001 0.001 0.0005;
+    0.001 0.001 0.0 0.001 0.0005;
+    0.001 0.001 0.001 0.0 0.0005;
+    0.0005 0.0005 0.0005 0.0005 0.0]
 
 const SPILL_COST = 0.001f0
 
@@ -71,11 +76,23 @@ const SPILL_COST = 0.001f0
 function sample_inflow(t::Int, prev_inflow::Vector{Float64}, rng::AbstractRNG)
     month = mod1(t, 12)
     prev_month = mod1(t - 1, 12)
+
+    # clamp raw noise to ±3 std devs before exponentiating
+    # mirrors updated sddp_ts.jl create_sampler
+    std_devs = sqrt.(diag(sigma_mats[month]))
     d = MvNormal(zeros(4), sigma_mats[month])
-    noise = exp.(rand(rng, d))
+    raw_noise = rand(rng, d)
+    clamped_noise = clamp.(raw_noise, -3 .* std_devs, 3 .* std_devs)
+    noise = exp.(clamped_noise)
+
     coef = -noise .* gamma_mat[month, :] .*
            exp_mu[month, :] ./ (exp_mu[prev_month, :] .+ 1e-8)
     rhs = noise .* (1 .- gamma_mat[month, :]) .* exp_mu[month, :]
+
+    # round to 4 digits — matches SDDP's support_points rounding
+    coef = round.(coef, digits=4)
+    rhs = round.(rhs, digits=4)
+
     return clamp.(rhs .- coef .* prev_inflow, 0.0, Inf)
 end
 
@@ -96,10 +113,16 @@ function HydrothermalEnv(horizon=T_HORIZON; seed=nothing)
     HydrothermalEnv(0, copy(stored_initial), copy(inflow_initial), rng, horizon)
 end
 
-obs_dim() = 1 + N_SYSTEMS + N_SYSTEMS + N_SYSTEMS # Month + Storage + Inflow + Demand
+obs_dim() = 1 + N_SYSTEMS + N_SYSTEMS + N_SYSTEMS  # Month + Storage + Inflow + Demand = 13
 
-# Action: hydro(4) + spill(4) + exchange(25) = 33
-act_dim() = N_SYSTEMS + N_SYSTEMS + 25
+# Action: hydro(4) + spill(4) + thermal(95) + deficit(16) + exchange(25) = 144
+# matches SDDP decision variables exactly (section 5.1.3)
+const N_DEFICIT = N_SYSTEMS * 4   # 4 subsystems × 4 depth levels = 16
+act_dim() = N_SYSTEMS +           # hydro:    4
+            N_SYSTEMS +           # spill:    4
+            N_THERMAL_TOTAL +     # thermal: 95
+            N_DEFICIT +           # deficit: 16
+            25                    # exchange: 25
 
 # 2. Update the get_obs function:
 function get_obs(env::HydrothermalEnv)
@@ -122,109 +145,106 @@ function reset!(env::HydrothermalEnv)
     return get_obs(env)
 end
 
-# Economic dispatch: cheapest units first — same result as SDDP LP for given total
-function economic_dispatch(i::Int, total_mw::Float64)
-    idx = thermal_sort_idx[i]
-    lbs = thermal_unit_lb[idx]
-    ubs = thermal_unit_ub[idx]
-    dispatch = copy(lbs)
-    remaining = total_mw - sum(lbs)
-
-    for j in eachindex(idx)
-        remaining <= 0 && break
-        extra = min(remaining, ubs[j] - lbs[j])
-        dispatch[j] += extra
-        remaining -= extra
-    end
-
-    result = zeros(length(thermal_idx[i]))
-    result[sortperm(thermal_sort_idx[i] .- (thermal_idx[i].start - 1))] = dispatch
-    return result
-end
-
 function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
     month = mod1(env.t + 1, 12)
     demand_t = demand_mat[month, :]
+    a = sigmoid.(raw_action)
 
-    # 🔥 SHIFTED SIGMOIDS: Injecting domain knowledge into the NN 🔥
-    a_hydro = sigmoid.(raw_action[1:4] .+ 3.0f0)  # Defaults to 95% (Keep lights on)
-    a = sigmoid.(raw_action .* 3.0f0)
+    # ── Index layout (144 actions, mirrors SDDP section 5.1.3) ────
+    # [1:4]     hydro q_it
+    # [5:8]     spill s_it
+    # [9:103]   thermal g_uit (95 units)
+    # [104:119] deficit df_ijt (4×4=16)
+    # [120:144] exchange ex_ijt (5×5=25)
 
-    # 1. ── Initial Exchange Mapping ──
-    exchange = reshape(Float64.(a[9:33]), 5, 5) .* exchange_ub_mat
+    # ── Step 1: Hydro — clip to bounds ────────────────────────────
+    avail_water = env.stored .+ env.inflow
+    hydro_gen = Float64.(a[1:4]) .* min.(hydro_gen_ub, avail_water)
+
+    # ── Step 2: Spill — enforce hydrological balance ───────────────
+    # v_it = v_{i,t-1} + a_it - q_it - s_it
+    # mandatory spill to prevent overflow + optional network spill
+    spill_mandatory = max.(avail_water .- hydro_gen .- stored_ub, 0.0)
+    spill_optional = Float64.(a[5:8]) .* env.stored .* 0.1
+    spill = spill_mandatory .+ spill_optional
+    # hydrological balance satisfied exactly:
+    new_stored = clamp.(avail_water .- hydro_gen .- spill, 0.0, stored_ub)
+
+    # ── Step 3: Exchange — clip to bounds, enforce transshipment ───
+    exchange = reshape(Float64.(a[120:144]), 5, 5) .* exchange_ub_mat
     for i in 1:5
         exchange[i, i] = 0.0
     end
 
-    # 2. ── PERFECT HUB BALANCE (Node 5) ──
-    exchange[5, 1:4] .= clamp.(exchange[5, 1:4], 0.0, exchange_ub_mat[5, 1:4])
-    actual_hub_out = sum(exchange[5, 1:4])
-    in_to_5 = sum(exchange[1:4, 5])
-    hub_flow = min(in_to_5, actual_hub_out)
-
-    if in_to_5 > 1e-5
-        exchange[1:4, 5] .*= (hub_flow / in_to_5)
-    end
-    if actual_hub_out > 1e-5
-        exchange[5, 1:4] .*= (hub_flow / actual_hub_out)
+    # transshipment balance: sum(ex_i5) == sum(ex_5i)
+    inflow_5 = sum(exchange[1:4, 5])
+    outflow_5 = sum(exchange[5, 1:4])
+    imbalance = inflow_5 - outflow_5
+    if outflow_5 > 1e-8
+        exchange[5, 1:4] .+= imbalance .* exchange[5, 1:4] ./ outflow_5
     end
     exchange = clamp.(exchange, 0.0, exchange_ub_mat)
 
-    # 3. ── Target Load ──
-    target_load = zeros(4)
-    for i in 1:4
-        target_load[i] = demand_t[i] + sum(exchange[i, :]) - sum(exchange[:, i])
+    # ── Step 4: Thermal — clip each unit to [lb, ub] ──────────────
+    thermal_raw = Float64.(a[9:103])
+    thermal_units = thermal_unit_lb .+ thermal_raw .* (thermal_unit_ub .- thermal_unit_lb)
+    thermal_gen = [sum(thermal_units[thermal_idx[i]]) for i in 1:4]
+
+    # ── Step 5: Deficit — clip to [0, d_it × β_j] ─────────────────
+    df_raw = Float64.(a[104:119])
+    deficit_mat = zeros(4, 4)
+    for i in 1:4, j in 1:4
+        cap = demand_t[i] * deficit_ub_frac[j]
+        deficit_mat[i, j] = df_raw[(i-1)*4+j] * cap
     end
 
-    # 4. ── Hydro Generation ──
-    avail_water = env.stored .+ env.inflow
-    hydro_gen = Float64.(a_hydro) .* min.(hydro_gen_ub, avail_water, max.(0.0, target_load))
-
-    # 5. ── THERMAL & DEFICIT (Pure Merit Order - Cost Tracking) ──
-    thermal_cost = 0.0
-    deficit_cost = 0.0
-
+    # ── Step 6: Power balance projection ──────────────────────────
+    # sum(g_uit) + sum(df_ijt) + q_it - sum(ex_ijt) + sum(ex_jit) = d_it
+    # scale thermal and deficit proportionally to satisfy this exactly
     for i in 1:4
-        remaining = target_load[i] - hydro_gen[i]
+        net_import = sum(exchange[:, i]) - sum(exchange[i, :])
+        total_gen = hydro_gen[i] + thermal_gen[i] +
+                    sum(deficit_mat[i, :]) + net_import
+        gap = demand_t[i] - total_gen
 
-        # A. Dispatch Thermal
-        if remaining > 0
-            sorted_units = sort(thermal_idx[i], by=u -> thermal_unit_cost[u])
-            for u in sorted_units
-                remaining <= 0 && break
-                gen = min(remaining, thermal_unit_ub[u])
-                thermal_cost += gen * thermal_unit_cost[u]  # Calculate R$ Cost
-                remaining -= gen
-            end
-        end
-
-        # B. Deficit (Piecewise Tiers for exact SDDP matching)
-        if remaining > 0
-            for j in 1:4
-                seg_ub = demand_t[i] * deficit_ub_frac[j]
-                used_def = min(remaining, seg_ub)
-                deficit_cost += used_def * deficit_obj_vec[j] # Calculate R$ Cost
-                remaining -= used_def
-                remaining <= 0 && break
+        if abs(gap) > 1e-6
+            flex = thermal_gen[i] + sum(deficit_mat[i, :])
+            if flex > 1e-8
+                scale = clamp((flex + gap) / flex, 0.0, 2.0)
+                # scale thermal units
+                for u in thermal_idx[i]
+                    thermal_units[u] = clamp(thermal_units[u] * scale,
+                        thermal_unit_lb[u],
+                        thermal_unit_ub[u])
+                end
+                thermal_gen[i] = sum(thermal_units[thermal_idx[i]])
+                # scale deficit
+                for j in 1:4
+                    deficit_mat[i, j] = clamp(deficit_mat[i, j] * scale,
+                        0.0,
+                        demand_t[i] * deficit_ub_frac[j])
+                end
             end
         end
     end
 
-    # 6. ── SPILL (Physics Only) ──
-    temp_stored = avail_water .- hydro_gen
-    spill = max.(0.0, temp_stored .- stored_ub)
-    new_stored = temp_stored .- spill
+    # ── Step 7: Cost (same as SDDP @stageobjective) ────────────────
+    thermal_cost = dot(thermal_unit_cost, thermal_units)
+    deficit_cost = sum(deficit_mat[i, j] * deficit_obj_vec[j]
+                       for i in 1:4, j in 1:4)
+    exchange_cost_val = sum(exchange .* exchange_cost_mat)
+    spill_cost_val = 0.001 * sum(spill)
+    total_cost = thermal_cost + deficit_cost + exchange_cost_val + spill_cost_val
 
-    # 7. ── Finalize ──
-    # Note: Assuming you have a constant SPILL_COST (e.g., 1.0 or 0.01) defined globally
-    total_cost = thermal_cost + deficit_cost + (1.0 * sum(spill))
-    reward = Float32(-total_cost / 1e8)
+    reward = Float32(-total_cost / 1e6)
 
+    # ── Advance state ──────────────────────────────────────────────
     env.stored = new_stored
     env.t += 1
     env.inflow = sample_inflow(env.t, env.inflow, env.rng)
+    done = env.t >= env.horizon
 
-    return get_obs(env), reward, (env.t >= env.horizon), total_cost
+    return get_obs(env), reward, done, total_cost
 end
 
 
@@ -247,15 +267,15 @@ Flux.@functor A2CAgent (actor, critic, log_std)
 
 function A2CAgent()
     actor = Chain(
-        Dense(OBS_DIM => 64, tanh),
-        Dense(64 => 64, tanh),
-        Dense(64 => ACT_DIM, init=small_init) # <--- Small weights applied here!
+        Dense(OBS_DIM => 256, tanh),
+        Dense(256 => 256, tanh),
+        Dense(256 => ACT_DIM, init=small_init)
     )
 
     critic = Chain(
-        Dense(OBS_DIM => 64, tanh),
-        Dense(64 => 64, tanh),
-        Dense(64 => 1)
+        Dense(OBS_DIM => 256, tanh),
+        Dense(256 => 256, tanh),
+        Dense(256 => 1)
     )
 
     A2CAgent(actor, critic, zeros(Float32, ACT_DIM))
@@ -310,7 +330,7 @@ end
 const GAMMA = 0.99f0
 const LR = 3f-4
 const N_STEPS = 12      # one full seasonal cycle per update
-const N_EPISODES = 50_000
+const N_EPISODES = 5_000
 
 function train_a2c(; seed=42, n_episodes=N_EPISODES)
     rng = MersenneTwister(seed)
@@ -344,7 +364,7 @@ function train_a2c(; seed=42, n_episodes=N_EPISODES)
 
                 push!(obs_buf, obs)
                 push!(act_buf, a)
-                push!(rew_buf, rew / 100.0f0)
+                push!(rew_buf, rew)
                 push!(val_buf, v)
                 push!(done_buf, done)
                 obs = next_obs
@@ -418,92 +438,60 @@ function evaluate_detailed(agent; n_episodes=5, seed=100)
         monthly_deficit = Float64[]
         monthly_spill = Float64[]
         monthly_exchange = Float64[]
+        monthly_thermal_cost = Float64[]
+        monthly_deficit_cost = Float64[]
 
         while !done
             μ = agent.actor(obs)
+            a = sigmoid.(μ)
             month = mod1(env.t + 1, 12)
             demand_t = demand_mat[month, :]
 
-            a = sigmoid.(μ .* 3.0f0)
-            month = mod1(env.t + 1, 12)
-            demand_t = demand_mat[month, :]
+            # same index layout as env_step!
+            avail_water = env.stored .+ env.inflow
+            hydro = Float64.(a[1:4]) .* min.(hydro_gen_ub, avail_water)
 
-            # 🔥 SHIFTED SIGMOIDS (For Evaluation) 🔥
-            a_hydro = sigmoid.(μ[1:4] .+ 3.0f0)
+            spill_mandatory = max.(avail_water .- hydro .- stored_ub, 0.0)
+            spill_optional = Float64.(a[5:8]) .* env.stored .* 0.1
+            spill = spill_mandatory .+ spill_optional
 
-            # 1. ── EXACT HUB BALANCE MATH ──
-            exch = reshape(Float64.(a[9:33]), 5, 5) .* exchange_ub_mat
+            thermal_raw = Float64.(a[9:8+N_THERMAL_TOTAL])
+            thermal_units = thermal_unit_lb .+ thermal_raw .* (thermal_unit_ub .- thermal_unit_lb)
+            thermal = [sum(thermal_units[thermal_idx[i]]) for i in 1:4]
+            t_cost = dot(thermal_unit_cost, thermal_units)
+
+            df_raw = Float64.(a[104:119])
+            deficit_mat = zeros(4, 4)
+            for i in 1:4, j in 1:4
+                cap = demand_t[i] * deficit_ub_frac[j]
+                deficit_mat[i, j] = df_raw[(i-1)*4+j] * cap
+            end
+            d_cost = sum(deficit_mat[i, j] * deficit_obj_vec[j] for i in 1:4, j in 1:4)
+
+            exchange = reshape(Float64.(a[120:144]), 5, 5) .* exchange_ub_mat
             for i in 1:5
-                exch[i, i] = 0.0
+                exchange[i, i] = 0.0
             end
-
-            exch[5, 1:4] .= clamp.(exch[5, 1:4], 0.0, exchange_ub_mat[5, 1:4])
-            actual_hub_out = sum(exch[5, 1:4])
-            in_to_5 = sum(exch[1:4, 5])
-            hub_flow = min(in_to_5, actual_hub_out)
-
-            if in_to_5 > 1e-5
-                exch[1:4, 5] .*= (hub_flow / in_to_5)
-            end
-            if actual_hub_out > 1e-5
-                exch[5, 1:4] .*= (hub_flow / actual_hub_out)
-            end
-            exch = clamp.(exch, 0.0, exchange_ub_mat)
-
-            # 2. ── TARGET LOAD ──
-            target_load = zeros(4)
-            for i in 1:4
-                target_load[i] = demand_t[i] + sum(exch[i, :]) - sum(exch[:, i])
-            end
-
-            # 3. ── HYDRO ──
-            avail = env.stored .+ env.inflow
-            #hydro = Float64.(a[1:4]) .* min.(hydro_gen_ub, avail, max.(0.0, target_load))
-            hydro = Float64.(a_hydro) .* min.(hydro_gen_ub, avail, max.(0.0, target_load))
-
-            # 4. ── THERMAL & DEFICIT (Pure Merit Order - MW Tracking) ──
-            thermal_total = 0.0
-            deficit_total = 0.0
-            for i in 1:4
-                remaining = target_load[i] - hydro[i]
-
-                # A. Dispatch Thermal
-                if remaining > 0
-                    sorted_units = sort(thermal_idx[i], by=u -> thermal_unit_cost[u])
-                    for u in sorted_units
-                        remaining <= 0 && break
-                        gen = min(remaining, thermal_unit_ub[u])
-                        thermal_total += gen  # Track MW
-                        remaining -= gen
-                    end
-                end
-
-                # B. Deficit (Whatever MW is left over)
-                if remaining > 0
-                    deficit_total += remaining  # Track MW
-                end
-            end
-
-            # 5. ── SPILL (Physics Only) ──
-            temp_stored = avail .- hydro
-            spill = max.(0.0, temp_stored .- stored_ub)
 
             push!(monthly_hydro, sum(hydro))
-            push!(monthly_thermal, thermal_total)
-            push!(monthly_deficit, deficit_total)
+            push!(monthly_thermal, sum(thermal))
+            push!(monthly_deficit, sum(deficit_mat))
             push!(monthly_spill, sum(spill))
-            push!(monthly_exchange, sum(exch))
+            push!(monthly_exchange, sum(exchange))
+            push!(monthly_thermal_cost, t_cost)
+            push!(monthly_deficit_cost, d_cost)
 
-            # Advance the environment safely using the real physics
             obs, _, done, _ = env_step!(env, μ)
         end
 
         @printf "\nEpisode %d:\n" ep
-        @printf "  Avg hydro:    %8.1f MW\n" mean(monthly_hydro)
-        @printf "  Avg thermal:  %8.1f MW\n" mean(monthly_thermal)
-        @printf "  Avg deficit:  %8.1f MW\n" mean(monthly_deficit)
-        @printf "  Avg spill:    %8.1f MW\n" mean(monthly_spill)
-        @printf "  Avg exchange: %8.1f MW\n" mean(monthly_exchange)
+        @printf "  Avg hydro:         %8.1f MW\n" mean(monthly_hydro)
+        @printf "  Avg thermal:       %8.1f MW\n" mean(monthly_thermal)
+        @printf "  Avg deficit:       %8.1f MW\n" mean(monthly_deficit)
+        @printf "  Avg spill:         %8.1f MW\n" mean(monthly_spill)
+        @printf "  Avg exchange:      %8.1f MW\n" mean(monthly_exchange)
+        @printf "  Avg thermal cost:  %8.2f M R\$\n" mean(monthly_thermal_cost) / 1e6
+        @printf "  Avg deficit cost:  %8.2f M R\$\n" mean(monthly_deficit_cost) / 1e6
     end
 end
 
@@ -556,7 +544,7 @@ println("Learning curve saved → a2c_learning_curve.png")
 evaluate_detailed(agent)
 
 const N_EVAL = 100
-const EVAL_SEED = 100
+const EVAL_SEED = 200
 scenarios_inflow, _ = generate_eval_scenarios(
     N_EVAL, T_HORIZON, gamma_mat, sigma_mats, exp_mu,
     inflow_initial; seed=EVAL_SEED
