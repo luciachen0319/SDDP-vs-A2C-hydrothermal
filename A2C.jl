@@ -16,6 +16,8 @@ using Random
 using Statistics
 using Printf
 using Plots
+using CSV
+using DataFrames
 
 include("data.jl")
 include("shared_scenarios.jl")
@@ -148,7 +150,26 @@ end
 function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
     month = mod1(env.t + 1, 12)
     demand_t = demand_mat[month, :]
-    a = sigmoid.(raw_action)
+    #a = sigmoid.(raw_action)
+
+    # ── Action Parsing with Domain Knowledge Shifts ──
+    a = zeros(Float32, length(raw_action))
+
+    # [1:4] Hydro: Shift +3.0 so it starts near 95% usage (save thermal/prevent deficits)
+    a[1:4] = sigmoid.(raw_action[1:4] .+ 3.0f0)
+
+    # [5:8] Spill: Shift -3.0 so it starts near 5% optional spill (stop wasting water)
+    a[5:8] = sigmoid.(raw_action[5:8] .- 3.0f0)
+
+    # [9:103] Thermal: No shift, starts at 50% capacity
+    a[9:103] = sigmoid.(raw_action[9:103])
+
+    # [104:119] Deficit: Shift -5.0 so it starts near 0.6% deficit! 
+    # (The agent should never intentionally ask for a blackout)
+    a[104:119] = sigmoid.(raw_action[104:119] .- 5.0f0)
+
+    # [120:144] Exchange: Multiplier of 3.0 (keeps 50% starting capacity, but makes it highly sensitive)
+    a[120:144] = sigmoid.(raw_action[120:144] .* 3.0f0)
 
     # ── Index layout (144 actions, mirrors SDDP section 5.1.3) ────
     # [1:4]     hydro q_it
@@ -199,30 +220,21 @@ function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
     end
 
     # ── Step 6: Power balance projection ──────────────────────────
-    # sum(g_uit) + sum(df_ijt) + q_it - sum(ex_ijt) + sum(ex_jit) = d_it
-    # scale thermal and deficit proportionally to satisfy this exactly
     for i in 1:4
         net_import = sum(exchange[:, i]) - sum(exchange[i, :])
-        total_gen = hydro_gen[i] + thermal_gen[i] +
-                    sum(deficit_mat[i, :]) + net_import
+        total_gen = hydro_gen[i] + thermal_gen[i] + sum(deficit_mat[i, :]) + net_import
         gap = demand_t[i] - total_gen
 
         if abs(gap) > 1e-6
             flex = thermal_gen[i] + sum(deficit_mat[i, :])
             if flex > 1e-8
                 scale = clamp((flex + gap) / flex, 0.0, 2.0)
-                # scale thermal units
                 for u in thermal_idx[i]
-                    thermal_units[u] = clamp(thermal_units[u] * scale,
-                        thermal_unit_lb[u],
-                        thermal_unit_ub[u])
+                    thermal_units[u] = clamp(thermal_units[u] * scale, thermal_unit_lb[u], thermal_unit_ub[u])
                 end
                 thermal_gen[i] = sum(thermal_units[thermal_idx[i]])
-                # scale deficit
                 for j in 1:4
-                    deficit_mat[i, j] = clamp(deficit_mat[i, j] * scale,
-                        0.0,
-                        demand_t[i] * deficit_ub_frac[j])
+                    deficit_mat[i, j] = clamp(deficit_mat[i, j] * scale, 0.0, demand_t[i] * deficit_ub_frac[j])
                 end
             end
         end
@@ -324,19 +336,85 @@ function a2c_loss(agent, obs_buf, act_buf, returns, adv)
 end
 
 # ─────────────────────────────────────────────────────────────────
-# 6. TRAINING LOOP
+# 6b. BEHAVIORAL CLONING (pre-train actor on SDDP demonstrations)
 # ─────────────────────────────────────────────────────────────────
+
+"""
+    behavioral_cloning(agent, sddp_trajectories; n_epochs, batch_size)
+
+Pre-trains the ACTOR to imitate SDDP actions via supervised learning.
+Loss = MSE between actor output and SDDP raw action (inverse-sigmoid).
+After this phase the actor starts near the SDDP policy before RL exploration.
+"""
+function behavioral_cloning(agent::A2CAgent, sddp_trajectories;
+    n_epochs=50, batch_size=64)
+    opt_actor = Flux.setup(Adam(1f-3), agent.actor)
+
+    # collect all (obs, sddp_raw_action) pairs
+    X = Vector{Float32}[]
+    Y = Vector{Float32}[]
+    for traj in sddp_trajectories
+        for (obs, action, _, _, _) in traj
+            push!(X, obs)
+            push!(Y, action)
+        end
+    end
+
+    num_samples = length(X)
+    println("Behavioral cloning: $num_samples (obs, action) pairs, $n_epochs epochs...")
+
+    for epoch in 1:n_epochs
+        indices = shuffle(1:num_samples)
+        epoch_loss = 0.0
+        n_batches = 0
+
+        for i in 1:batch_size:num_samples
+            idx = indices[i:min(i + batch_size - 1, num_samples)]
+            batch_x = reduce(hcat, X[idx])   # OBS_DIM × batch
+            batch_y = reduce(hcat, Y[idx])   # ACT_DIM × batch
+
+            loss, grads = Flux.withgradient(agent.actor) do ac
+                pred = ac(batch_x)
+                mean((pred .- batch_y) .^ 2)   # MSE — actor mimics SDDP
+            end
+
+            Flux.update!(opt_actor, agent.actor, grads[1])
+            epoch_loss += loss
+            n_batches += 1
+        end
+
+        if epoch % 10 == 0
+            @printf "BC Epoch %3d | Actor MSE: %.6f\n" epoch (epoch_loss / n_batches)
+        end
+    end
+    println("Behavioral cloning complete.")
+end
 
 const GAMMA = 0.99f0
 const LR = 3f-4
-const N_STEPS = 12      # one full seasonal cycle per update
-const N_EPISODES = 5_000
+const N_STEPS = 12        # one full seasonal cycle per update
+const N_EPISODES = 10_000
+const BC_LAMBDA_START = 0.5f0   # initial weight on BC loss (1.0 = pure imitation)
+const BC_LAMBDA_END = 0.0f0   # final weight on BC loss (0.0 = pure A2C)
 
-function train_a2c(; seed=42, n_episodes=N_EPISODES)
+function train_a2c(agent::A2CAgent, sddp_trajectories=nothing;
+    seed=42, n_episodes=N_EPISODES)
     rng = MersenneTwister(seed)
     env = HydrothermalEnv(T_HORIZON; seed=seed)
-    agent = A2CAgent()
     opt = Flux.setup(Adam(LR), agent)
+
+    # build BC lookup: pool all SDDP (obs, action) pairs for mixed loss
+    bc_obs = Vector{Float32}[]
+    bc_act = Vector{Float32}[]
+    if sddp_trajectories !== nothing
+        for traj in sddp_trajectories
+            for (obs, action, _, _, _) in traj
+                push!(bc_obs, obs)
+                push!(bc_act, action)
+            end
+        end
+        println("Mixed training: $(length(bc_obs)) SDDP pairs available for BC loss.")
+    end
 
     ep_costs = Float64[]
 
@@ -344,6 +422,10 @@ function train_a2c(; seed=42, n_episodes=N_EPISODES)
         obs = reset!(env)
         ep_cost = 0.0
         done = false
+
+        # λ anneals linearly from BC_LAMBDA_START → BC_LAMBDA_END over all episodes
+        λ_bc = BC_LAMBDA_START +
+               (BC_LAMBDA_END - BC_LAMBDA_START) * Float32(ep - 1) / Float32(n_episodes - 1)
 
         obs_buf = Vector{Float32}[]
         act_buf = Vector{Float32}[]
@@ -383,7 +465,22 @@ function train_a2c(; seed=42, n_episodes=N_EPISODES)
             adv = (adv .- mean(adv)) ./ (std(adv) .+ 1f-8)
 
             _, grads = Flux.withgradient(agent) do ag
-                a2c_loss(ag, obs_buf, act_buf, returns, adv)
+                # A2C loss
+                a2c_l = a2c_loss(ag, obs_buf, act_buf, returns, adv)
+
+                # BC loss: pull actor toward SDDP actions on a random mini-batch
+                bc_l = 0.0f0
+                if length(bc_obs) > 0 && λ_bc > 0.0f0
+                    n_bc = min(length(obs_buf), length(bc_obs))
+                    idx = rand(1:length(bc_obs), n_bc)
+                    bx = reduce(hcat, bc_obs[idx])
+                    by = reduce(hcat, bc_act[idx])
+                    pred = ag.actor(bx)
+                    bc_l = mean((pred .- by) .^ 2)
+                end
+
+                # mixed loss: λ anneals from BC_LAMBDA_START → 0
+                (1.0f0 - λ_bc) * a2c_l + λ_bc * bc_l
             end
             Flux.update!(opt, agent, grads[1])
 
@@ -397,13 +494,12 @@ function train_a2c(; seed=42, n_episodes=N_EPISODES)
         push!(ep_costs, ep_cost)
         if ep % 100 == 0
             avg = mean(ep_costs[max(1, end - 99):end]) / 1e6
-            @printf "Ep %4d | avg cost (last 100): %8.2f M R\$\n" ep avg
+            @printf "Ep %4d | λ_bc=%.3f | avg cost (last 100): %8.2f M R\$\n" ep λ_bc avg
         end
     end
 
     return agent, ep_costs
 end
-
 # ─────────────────────────────────────────────────────────────────
 # 7. EVALUATION
 # ─────────────────────────────────────────────────────────────────
@@ -443,7 +539,26 @@ function evaluate_detailed(agent; n_episodes=5, seed=100)
 
         while !done
             μ = agent.actor(obs)
-            a = sigmoid.(μ)
+            #a = sigmoid.(μ)
+            # ── Action Parsing with Domain Knowledge Shifts ──
+            a = zeros(Float32, length(μ))
+
+            # [1:4] Hydro: Shift +3.0 so it starts near 95% usage (save thermal/prevent deficits)
+            a[1:4] = sigmoid.(μ[1:4] .+ 3.0f0)
+
+            # [5:8] Spill: Shift -3.0 so it starts near 5% optional spill (stop wasting water)
+            a[5:8] = sigmoid.(μ[5:8] .- 3.0f0)
+
+            # [9:103] Thermal: No shift, starts at 50% capacity
+            a[9:103] = sigmoid.(μ[9:103])
+
+            # [104:119] Deficit: Shift -5.0 so it starts near 0.6% deficit! 
+            # (The agent should never intentionally ask for a blackout)
+            a[104:119] = sigmoid.(μ[104:119] .- 5.0f0)
+
+            # [120:144] Exchange: Multiplier of 3.0 (keeps 50% starting capacity, but makes it highly sensitive)
+            a[120:144] = sigmoid.(μ[120:144] .* 3.0f0)
+
             month = mod1(env.t + 1, 12)
             demand_t = demand_mat[month, :]
 
@@ -525,18 +640,199 @@ function evaluate_on_scenarios(agent::A2CAgent,
 end
 
 # ─────────────────────────────────────────────────────────────────
+# 9. SDDP DATA LOADING AND TRAINING
+# ─────────────────────────────────────────────────────────────────
+
+const SDDP_DATA_PATH = "/Users/xinyuzhuang/Documents/ISEN637-Course-Project/output/simulations/sddp_train/ts/"
+const N_SDDP_SIMULATIONS = 500
+const SDDP_HORIZON = 24 # Each simulation has 24 stages
+
+"""
+    load_sddp_data(base_path::String, num_simulations::Int, horizon::Int)
+
+Loads SDDP simulation data from the specified path.
+
+Reconstructs observations and rewards from the 6 CSV files generated per stage:
+`inflow.csv`, `thermal_gen.csv`, `exchange.csv`, `spill.csv`, `deficit.csv`, `storage.csv`.
+
+Returns a Vector of trajectories, where each trajectory is a Vector of
+`(obs, sddp_raw_action, reward, next_obs, done)` tuples.
+"""
+function load_sddp_data(base_path::String, num_simulations::Int, horizon::Int)
+    all_trajectories = []
+    # We need the initial state to start the first stage of each simulation
+    initial_stored = Float32.(stored_initial)
+    initial_inflow = Float32.(inflow_initial)
+
+    println("Loading SDDP simulation data from $base_path...")
+
+    for sim_idx in 1:num_simulations
+        sim_path = joinpath(base_path, "simulation_$(sim_idx)")
+        current_trajectory = []
+
+        # Track state across stages within a simulation
+        current_stored = copy(initial_stored)
+        current_inflow = copy(initial_inflow)
+
+        sim_ok = true
+        for t in 1:horizon # t is the stage number, 1 to 24
+            stage_path = joinpath(sim_path, "stage_$(t)")
+
+            # --- Load SDDP decision values ---
+            local val_hydro, val_spill, val_thermal, val_deficit, val_exchange, next_stored
+            try
+                val_hydro = Float64.(CSV.read(joinpath(stage_path, "inflow.csv"), DataFrame).value)
+                val_spill = Float64.(CSV.read(joinpath(stage_path, "spill.csv"), DataFrame).value)
+                val_thermal = Float64.(CSV.read(joinpath(stage_path, "thermal_gen.csv"), DataFrame).value)
+                val_deficit = Float64.(CSV.read(joinpath(stage_path, "deficit.csv"), DataFrame).value)
+                val_exchange = Float64.(CSV.read(joinpath(stage_path, "exchange.csv"), DataFrame).value)
+
+                # --- Load SDDP state (Storage level at END of stage) ---
+                next_stored = Float64.(CSV.read(joinpath(stage_path, "stored.csv"), DataFrame).value)
+            catch
+                sim_ok = false
+                break
+            end
+
+            # --- Construct current observation ---
+            month = mod1(t, 12)
+            obs_current = vcat(Float32[month/12.0],
+                Float32.(current_stored ./ stored_ub),
+                Float32.(current_inflow ./ 100000.0),
+                Float32.(demand_mat[month, :] ./ 30000.0))
+
+            # --- Calculate Cost (to create Reward) ---
+            # Re-using logic from env_step! to ensure consistency
+            thermal_cost_val = dot(thermal_unit_cost, val_thermal)
+            deficit_cost_val = sum(val_deficit[i] * deficit_obj_vec[mod1(i, 4)] for i in 1:16)
+            exchange_cost_val = sum(reshape(val_exchange, 5, 5) .* exchange_cost_mat)
+            spill_cost_val = SPILL_COST * sum(val_spill)
+            stage_total_cost = thermal_cost_val + deficit_cost_val + exchange_cost_val + spill_cost_val
+            sddp_reward = Float32(-stage_total_cost / 1e6)
+
+            # --- Normalize values to [0,1] for A2C actions ---
+            # We map actual generation to fractions based on the bounds defined in constants
+            avail_water = current_stored .+ current_inflow
+            a_hydro = Float32.(val_hydro ./ max.(1.0, min.(hydro_gen_ub, avail_water)))
+            a_spill = Float32.(val_spill ./ max.(1.0, current_stored .* 0.1))
+            a_thermal = Float32.((val_thermal .- thermal_unit_lb) ./ max.(1.0, thermal_unit_ub .- thermal_unit_lb))
+
+            # Deficit and Exchange normalization
+            demand_t = demand_mat[month, :]
+            caps_deficit = vcat([demand_t[i] .* deficit_ub_frac for i in 1:4]...)
+            a_deficit = Float32.(val_deficit ./ max.(1.0, caps_deficit))
+            a_exchange = Float32.(val_exchange ./ max.(1.0, vec(exchange_ub_mat)))
+
+            # Combine and convert to raw_action (inverse sigmoid)
+            sddp_action_a = vcat(a_hydro, a_spill, a_thermal, a_deficit, a_exchange)
+            sddp_action_a_clamped = clamp.(sddp_action_a, 1e-8, 1.0f0 - 1e-8)
+            sddp_raw_action = Float32.(log.(sddp_action_a_clamped ./ (1.0f0 .- sddp_action_a_clamped)))
+
+            # --- Derive next inflow from water balance ---
+            # v_t = v_{t-1} + inflow_t - hydro_t - spill_t  => inflow_t = v_t - v_{t-1} + hydro_t + spill_t
+            # Note: In SDDP, reservoir values are often saved at the end of the period.
+            realized_inflow = clamp.(next_stored .- current_stored .+ val_hydro .+ val_spill, 0.0, Inf)
+
+            # --- Construct next observation ---
+            next_month = mod1(t + 1, 12)
+            obs_next = vcat(Float32[next_month/12.0],
+                Float32.(next_stored ./ stored_ub),
+                Float32.(realized_inflow ./ 100000.0), # Approximate for the next state
+                Float32.(demand_mat[next_month, :] ./ 30000.0))
+
+            # --- Determine if done ---
+            done = (t == horizon)
+
+            push!(current_trajectory, (obs_current, sddp_raw_action, sddp_reward, obs_next, done))
+
+            # Update state for next stage
+            current_stored = Float32.(next_stored)
+            current_inflow = Float32.(realized_inflow)
+        end
+        sim_ok && push!(all_trajectories, current_trajectory)
+    end
+    println("Finished loading SDDP data. Total trajectories: $(length(all_trajectories))")
+    return all_trajectories
+end
+
+function warm_start_critic(agent::A2CAgent, sddp_trajectories; n_epochs=50, batch_size=64)
+    # Use a slightly higher learning rate for supervised warm-up
+    opt_critic = Flux.setup(Adam(1f-3), agent.critic)
+
+    X = Vector{Float32}[]
+    Y = Float32[]
+
+    # Process trajectories to calculate cumulative discounted returns
+    for traj in sddp_trajectories
+        T = length(traj)
+        running_return = 0.0f0
+
+        # Calculate returns backwards: G_t = r_t + gamma * G_{t+1}
+        for t in T:-1:1
+            obs, _, reward, _, _ = traj[t]
+            running_return = reward + GAMMA * running_return
+            push!(X, obs)
+            push!(Y, running_return)
+        end
+    end
+
+    num_samples = length(X)
+    println("Warm-starting Critic on $num_samples state-value pairs for $n_epochs epochs...")
+
+    for epoch in 1:n_epochs
+        indices = shuffle(1:num_samples)
+        epoch_loss = 0.0
+
+        for i in 1:batch_size:num_samples
+            idx = indices[i:min(i + batch_size - 1, num_samples)]
+            batch_x = reduce(hcat, X[idx])
+            batch_y = Y[idx]
+
+            loss, grads = Flux.withgradient(agent.critic) do c
+                pred = vec(c(batch_x))
+                mean((pred .- batch_y) .^ 2) # MSE Loss
+            end
+
+            Flux.update!(opt_critic, agent.critic, grads[1])
+            epoch_loss += loss
+        end
+
+        if epoch % 10 == 0
+            @printf "Warm-up Epoch %d | MSE Loss: %.4f\n" epoch (epoch_loss / ceil(num_samples / batch_size))
+        end
+    end
+end
+
+# ─────────────────────────────────────────────────────────────────
 # 8. MAIN
 # ─────────────────────────────────────────────────────────────────
 
 println("Training A2C for Hydrothermal Scheduling (T=$T_HORIZON months)...")
-agent, ep_costs = train_a2c(seed=42)
+
+# ── Phase 0: Load SDDP demonstrations ────────────────────────────
+println("\n--- PHASE 0: Loading SDDP Data ---")
+phase0_time = @elapsed sddp_trajectories = load_sddp_data(SDDP_DATA_PATH, N_SDDP_SIMULATIONS, SDDP_HORIZON)
+
+# ── Phase 1: Behavioral cloning — warm-start actor AND critic ─────
+println("\n--- PHASE 1: Behavioral Cloning (Actor + Critic Warm-Start) ---")
+agent = A2CAgent()
+phase1_time = @elapsed begin
+    behavioral_cloning(agent, sddp_trajectories; n_epochs=50)
+    warm_start_critic(agent, sddp_trajectories; n_epochs=50)
+end
+
+# ── Phase 2: Mixed BC + A2C training with λ annealing ─────────────
+# λ_bc starts at 0.5 (half imitation, half RL) and anneals to 0 (pure RL)
+# agent continues exploring while still being pulled toward SDDP behavior early on
+println("\n--- PHASE 2: Mixed BC + A2C Training (λ annealing 0.5 → 0) ---")
+phase2_time = @elapsed agent, ep_costs = train_a2c(agent, sddp_trajectories; seed=42, n_episodes=N_EPISODES)
 
 # learning curve
 smooth_n = 50
 smooth = [mean(ep_costs[max(1, i - smooth_n + 1):i]) for i in eachindex(ep_costs)]
-p = plot(ep_costs ./ 1e6, alpha=0.3, label="Episode cost",
-    xlabel="Episode", ylabel="Total Cost (M R\$)",
-    title="A2C Learning Curve — Hydrothermal Scheduling")
+p = plot(ep_costs ./ 1e6, alpha=0.3, label="Episode avg cost",
+    xlabel="Episode", ylabel="Avg Total Cost (M R\$)",
+    title="A2C Learning Curve (Critic Warm-Start)")
 plot!(p, smooth ./ 1e6, lw=2, label="$(smooth_n)-ep moving avg")
 savefig(p, "a2c_learning_curve.png")
 println("Learning curve saved → a2c_learning_curve.png")
@@ -544,9 +840,16 @@ println("Learning curve saved → a2c_learning_curve.png")
 evaluate_detailed(agent)
 
 const N_EVAL = 100
-const EVAL_SEED = 200
+const EVAL_SEED = 204
 scenarios_inflow, _ = generate_eval_scenarios(
     N_EVAL, T_HORIZON, gamma_mat, sigma_mats, exp_mu,
     inflow_initial; seed=EVAL_SEED
 )
-shared_eval_costs = evaluate_on_scenarios(agent, scenarios_inflow)
+eval_time = @elapsed shared_eval_costs = evaluate_on_scenarios(agent, scenarios_inflow)
+
+println("\n--- Performance Summary ---")
+println("Phase 0 (Data Loading) Time: ", round(phase0_time, digits=2), " seconds")
+println("Phase 1 (Warm-start) Time:   ", round(phase1_time, digits=2), " seconds")
+println("Phase 2 (RL Training) Time:  ", round(phase2_time, digits=2), " seconds")
+println("Evaluation Time:             ", round(eval_time, digits=2), " seconds")
+println("Total Execution Time:        ", round(phase0_time + phase1_time + phase2_time + eval_time, digits=2), " seconds")
