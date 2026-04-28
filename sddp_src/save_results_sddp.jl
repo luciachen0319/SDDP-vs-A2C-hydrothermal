@@ -89,8 +89,8 @@ function save_results_sddp(simulations, output_dir; thermal, save_individual=tru
             end
             
             # Process hydro
-            if haskey(stage_data, :hydro)
-                values = [stage_data[:hydro][i] for i in 1:4]
+            if haskey(stage_data, :hydro_gen)
+                values = [stage_data[:hydro_gen][i] for i in 1:4]
                 hydro_sum[:, stage_idx] .+= values
                 if save_individual
                     CSV.write(

@@ -147,6 +147,104 @@ function reset!(env::HydrothermalEnv)
     return get_obs(env)
 end
 
+# Merit-order economic dispatch projection onto the power balance hyperplane.
+# Given fixed hydro and exchange, adjusts thermal and deficit so that
+# generation == demand for each subsystem.  Thermal units are dispatched
+# cheapest-first (thermal_sort_idx); deficit levels are added/removed in
+# cost order (deficit_obj_vec ascending).
+# Three-pass projection onto the power balance hyperplane:
+#   Pass 1: compute per-subsystem power gaps
+#   Pass 2: route surplus from over-generating subsystems to under-generating ones
+#           via available exchange links (cheap spatial rebalancing before deficit)
+#   Pass 3: adjust thermal and deficit for any remaining gaps
+# Node-5 transshipment balance is preserved because pass 2 only touches
+# exchange[j,i] for j,i in 1:4 (direct subsystem-to-subsystem links).
+function project_power_balance!(thermal_units, deficit_mat, hydro_gen, exchange, demand_t)
+    # Pass 1: compute gaps
+    gaps = zeros(4)
+    for i in 1:4
+        net_import = sum(exchange[:, i]) - sum(exchange[i, :])
+        gaps[i] = demand_t[i] - hydro_gen[i] -
+                  sum(thermal_units[thermal_idx[i]]) -
+                  sum(deficit_mat[i, :]) - net_import
+    end
+
+    # Pass 2a: direct exchange between subsystems (j→i, both in 1:4)
+    for i in 1:4          # deficit region
+        gaps[i] <= 1e-6 && continue
+        for j in 1:4      # surplus region
+            j == i && continue
+            gaps[j] >= -1e-6 && continue
+            headroom = exchange_ub_mat[j, i] - exchange[j, i]
+            headroom <= 1e-8 && continue
+            transfer = min(-gaps[j], gaps[i], headroom)
+            if transfer > 1e-6
+                exchange[j, i] += transfer
+                gaps[i] -= transfer
+                gaps[j] += transfer
+            end
+        end
+    end
+
+    # Pass 2b: transit routing through node 5 (the transshipment hub).
+    # SDDP routes power as region1→node5→region4 because direct r1→r4 links
+    # may not exist. Adding equal amounts to exchange[j,5] and exchange[5,i]
+    # preserves node 5's transshipment balance (inflow == outflow).
+    for i in 1:4          # deficit region
+        gaps[i] <= 1e-6 && continue
+        for j in 1:4      # surplus region
+            j == i && continue
+            gaps[j] >= -1e-6 && continue
+            h_j5 = exchange_ub_mat[j, 5] - exchange[j, 5]   # headroom j→node5
+            h_5i = exchange_ub_mat[5, i] - exchange[5, i]   # headroom node5→i
+            headroom = min(h_j5, h_5i)
+            headroom <= 1e-8 && continue
+            transfer = min(-gaps[j], gaps[i], headroom)
+            if transfer > 1e-6
+                exchange[j, 5] += transfer
+                exchange[5, i] += transfer
+                gaps[i] -= transfer
+                gaps[j] += transfer
+            end
+        end
+    end
+
+    # Pass 3: thermal / deficit adjustments for any remaining gaps
+    for i in 1:4
+        abs(gaps[i]) <= 1e-6 && continue
+
+        if gaps[i] > 0  # under-generation: cheapest thermal first, then deficit
+            for u in thermal_sort_idx[i]
+                gaps[i] <= 1e-6 && break
+                add = min(gaps[i], thermal_unit_ub[u] - thermal_units[u])
+                thermal_units[u] += add
+                gaps[i] -= add
+            end
+            for j in 1:4
+                gaps[i] <= 1e-6 && break
+                cap = demand_t[i] * deficit_ub_frac[j] - deficit_mat[i, j]
+                add = min(gaps[i], max(cap, 0.0))
+                deficit_mat[i, j] += add
+                gaps[i] -= add
+            end
+        else  # over-generation: shed most expensive first
+            excess = -gaps[i]
+            for j in 4:-1:1
+                excess <= 1e-6 && break
+                reduce = min(excess, deficit_mat[i, j])
+                deficit_mat[i, j] -= reduce
+                excess -= reduce
+            end
+            for u in reverse(thermal_sort_idx[i])
+                excess <= 1e-6 && break
+                reduce = min(excess, thermal_units[u] - thermal_unit_lb[u])
+                thermal_units[u] -= reduce
+                excess -= reduce
+            end
+        end
+    end
+end
+
 function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
     month = mod1(env.t + 1, 12)
     demand_t = demand_mat[month, :]
@@ -219,25 +317,10 @@ function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
         deficit_mat[i, j] = df_raw[(i-1)*4+j] * cap
     end
 
-    # ── Step 6: Power balance projection ──────────────────────────
+    # ── Step 6: Power balance projection (merit-order economic dispatch) ──
+    project_power_balance!(thermal_units, deficit_mat, hydro_gen, exchange, demand_t)
     for i in 1:4
-        net_import = sum(exchange[:, i]) - sum(exchange[i, :])
-        total_gen = hydro_gen[i] + thermal_gen[i] + sum(deficit_mat[i, :]) + net_import
-        gap = demand_t[i] - total_gen
-
-        if abs(gap) > 1e-6
-            flex = thermal_gen[i] + sum(deficit_mat[i, :])
-            if flex > 1e-8
-                scale = clamp((flex + gap) / flex, 0.0, 2.0)
-                for u in thermal_idx[i]
-                    thermal_units[u] = clamp(thermal_units[u] * scale, thermal_unit_lb[u], thermal_unit_ub[u])
-                end
-                thermal_gen[i] = sum(thermal_units[thermal_idx[i]])
-                for j in 1:4
-                    deficit_mat[i, j] = clamp(deficit_mat[i, j] * scale, 0.0, demand_t[i] * deficit_ub_frac[j])
-                end
-            end
-        end
+        thermal_gen[i] = sum(thermal_units[thermal_idx[i]])
     end
 
     # ── Step 7: Cost (same as SDDP @stageobjective) ────────────────
@@ -643,9 +726,11 @@ end
 # 9. SDDP DATA LOADING AND TRAINING
 # ─────────────────────────────────────────────────────────────────
 
-const SDDP_DATA_PATH = "/Users/xinyuzhuang/Documents/ISEN637-Course-Project/output/simulations/sddp_train/ts/"
-const N_SDDP_SIMULATIONS = 500
-const SDDP_HORIZON = 24 # Each simulation has 24 stages
+const SDDP_DATA_PATH = joinpath(@__DIR__, "output/simulations/sddp_eval/ts/")
+const N_SDDP_SIMULATIONS = 100
+# SDDP.jl records one entry per stochastic stage; the deterministic first stage
+# is not separately returned, so each simulation has 23 saved stages (SDDP stages 2-24).
+const SDDP_HORIZON = 23
 
 """
     load_sddp_data(base_path::String, num_simulations::Int, horizon::Int)
@@ -679,16 +764,22 @@ function load_sddp_data(base_path::String, num_simulations::Int, horizon::Int)
             stage_path = joinpath(sim_path, "stage_$(t)")
 
             # --- Load SDDP decision values ---
-            local val_hydro, val_spill, val_thermal, val_deficit, val_exchange, next_stored
+            local val_hydro, val_inflow, val_spill, val_thermal, val_deficit, val_exchange, next_stored
             try
-                val_hydro = Float64.(CSV.read(joinpath(stage_path, "inflow.csv"), DataFrame).value)
-                val_spill = Float64.(CSV.read(joinpath(stage_path, "spill.csv"), DataFrame).value)
+                val_inflow  = Float64.(CSV.read(joinpath(stage_path, "inflow.csv"),      DataFrame).value)
+                val_spill   = Float64.(CSV.read(joinpath(stage_path, "spill.csv"),       DataFrame).value)
                 val_thermal = Float64.(CSV.read(joinpath(stage_path, "thermal_gen.csv"), DataFrame).value)
-                val_deficit = Float64.(CSV.read(joinpath(stage_path, "deficit.csv"), DataFrame).value)
-                val_exchange = Float64.(CSV.read(joinpath(stage_path, "exchange.csv"), DataFrame).value)
+                val_deficit = Float64.(CSV.read(joinpath(stage_path, "deficit.csv"),     DataFrame).value)
+                val_exchange = Float64.(CSV.read(joinpath(stage_path, "exchange.csv"),   DataFrame).value)
+                next_stored  = Float64.(CSV.read(joinpath(stage_path, "stored.csv"),     DataFrame).value)
 
-                # --- Load SDDP state (Storage level at END of stage) ---
-                next_stored = Float64.(CSV.read(joinpath(stage_path, "stored.csv"), DataFrame).value)
+                # Reconstruct hydro generation from the water balance:
+                #   stored_out = stored_in + inflow - hydro_gen - spill
+                # => hydro_gen = stored_in + inflow - stored_out - spill
+                # This is always correct and avoids relying on hydro.csv,
+                # which is all-zeros in existing data due to a save-function bug
+                # (:hydro_gen key was saved as :hydro, now fixed in save_results_sddp.jl).
+                val_hydro = max.(0.0, Float64.(current_stored) .+ val_inflow .- next_stored .- val_spill)
             catch
                 sim_ok = false
                 break
@@ -723,15 +814,27 @@ function load_sddp_data(base_path::String, num_simulations::Int, horizon::Int)
             a_deficit = Float32.(val_deficit ./ max.(1.0, caps_deficit))
             a_exchange = Float32.(val_exchange ./ max.(1.0, vec(exchange_ub_mat)))
 
-            # Combine and convert to raw_action (inverse sigmoid)
+            # Combine and invert each action transformation to get the pre-transformation
+            # raw targets the actor must produce.  Each group has its own shift/scale:
+            #   hydro    [1:4]    : a = sigmoid(raw + 3)  →  raw = logit(a) - 3
+            #   spill    [5:8]    : a = sigmoid(raw - 3)  →  raw = logit(a) + 3
+            #   thermal  [9:103]  : a = sigmoid(raw)      →  raw = logit(a)
+            #   deficit  [104:119]: a = sigmoid(raw - 5)  →  raw = logit(a) + 5
+            #   exchange [120:144]: a = sigmoid(raw * 3)  →  raw = logit(a) / 3
             sddp_action_a = vcat(a_hydro, a_spill, a_thermal, a_deficit, a_exchange)
-            sddp_action_a_clamped = clamp.(sddp_action_a, 1e-8, 1.0f0 - 1e-8)
-            sddp_raw_action = Float32.(log.(sddp_action_a_clamped ./ (1.0f0 .- sddp_action_a_clamped)))
+            sddp_action_a_clamped = clamp.(sddp_action_a, 1e-6, 1.0f0 - 1e-6)
+            logit_a = Float32.(log.(sddp_action_a_clamped ./ (1.0f0 .- sddp_action_a_clamped)))
+            sddp_raw_action = vcat(
+                logit_a[1:4]    .- 3.0f0,   # hydro
+                logit_a[5:8]    .+ 3.0f0,   # spill
+                logit_a[9:103],              # thermal
+                logit_a[104:119] .+ 5.0f0,  # deficit
+                logit_a[120:144] ./ 3.0f0   # exchange
+            )
 
-            # --- Derive next inflow from water balance ---
-            # v_t = v_{t-1} + inflow_t - hydro_t - spill_t  => inflow_t = v_t - v_{t-1} + hydro_t + spill_t
-            # Note: In SDDP, reservoir values are often saved at the end of the period.
-            realized_inflow = clamp.(next_stored .- current_stored .+ val_hydro .+ val_spill, 0.0, Inf)
+            # inflow[i].out from SDDP is the realized water inflow for this stage —
+            # use it directly rather than reconstructing from the water balance.
+            realized_inflow = val_inflow
 
             # --- Construct next observation ---
             next_month = mod1(t + 1, 12)
