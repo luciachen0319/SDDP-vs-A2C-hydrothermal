@@ -74,7 +74,7 @@ The two methods must be run **in order**: SDDP first, then A2C (A2C loads SDDP s
 From the `sddp_src/` directory:
 
 ```bash
-julia sddp_ts_time.jl
+julia sddp_ts.jl
 ```
 
 This will:
