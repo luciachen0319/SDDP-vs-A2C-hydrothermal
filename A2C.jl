@@ -2,7 +2,7 @@
 A2C for Hydrothermal Scheduling — Julia implementation
 Mirrors sddp_ts.jl:
   - Same 4 subsystems: SE, S, NE, N
-  - Same PAR(1) inflow model (γ, Σ, ㄕㄛmu from data.jl)
+  - Same PAR(1) inflow model (γ, Σ, mu from data.jl)
   - Thermal: economic dispatch across 95 units (exact per-unit cost)
   - Exchange: learned approximation with anti-cycling penalty
   - Deficit: single-level per subsystem (simplified for training stability)
@@ -301,14 +301,14 @@ function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
     # Strategy: scale the smaller side up to match the larger side,
     # using available headroom. If headroom is insufficient, scale
     # the larger side down instead.
-    inflow_5  = sum(exchange[1:4, 5])   # flow into hub
+    inflow_5 = sum(exchange[1:4, 5])   # flow into hub
     outflow_5 = sum(exchange[5, 1:4])   # flow out of hub
 
     if abs(inflow_5 - outflow_5) > 1e-8
         if inflow_5 > outflow_5
             # Try to scale up outflows to match inflows
             headroom = sum(exchange_ub_mat[5, j] - exchange[5, j] for j in 1:4)
-            needed   = inflow_5 - outflow_5
+            needed = inflow_5 - outflow_5
             if headroom >= needed
                 # Scale outflows up proportionally by headroom
                 for j in 1:4
@@ -327,14 +327,14 @@ function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
                     scale = target / inflow_5
                     for i in 1:4
                         exchange[i, 5] = clamp(exchange[i, 5] * scale,
-                                               0.0, exchange_ub_mat[i, 5])
+                            0.0, exchange_ub_mat[i, 5])
                     end
                 end
             end
         else
             # outflow_5 > inflow_5: mirror case, scale up inflows
             headroom = sum(exchange_ub_mat[i, 5] - exchange[i, 5] for i in 1:4)
-            needed   = outflow_5 - inflow_5
+            needed = outflow_5 - inflow_5
             if headroom >= needed
                 for i in 1:4
                     h = exchange_ub_mat[i, 5] - exchange[i, 5]
@@ -349,7 +349,7 @@ function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
                     scale = target / outflow_5
                     for j in 1:4
                         exchange[5, j] = clamp(exchange[5, j] * scale,
-                                               0.0, exchange_ub_mat[5, j])
+                            0.0, exchange_ub_mat[5, j])
                     end
                 end
             end
