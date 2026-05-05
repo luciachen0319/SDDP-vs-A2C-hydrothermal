@@ -1,4 +1,4 @@
-# ISEN 637 Course Project — Hydrothermal Scheduling: SDDP vs. A2C
+# Hydrothermal Scheduling: SDDP vs. A2C
 
 ## Project Overview
 
