@@ -289,74 +289,20 @@ function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
     # hydrological balance satisfied exactly:
     new_stored = clamp.(avail_water .- hydro_gen .- spill, 0.0, stored_ub)
 
-    # ── Step 3: Exchange — exact transshipment projection ──────────
+    # ── Step 3: Exchange — clip to bounds, enforce transshipment ───
     exchange = reshape(Float64.(a[120:144]), 5, 5) .* exchange_ub_mat
     for i in 1:5
         exchange[i, i] = 0.0
     end
-    # Clip to capacity bounds first
-    exchange = clamp.(exchange, 0.0, exchange_ub_mat)
 
-    # Enforce transshipment equality: sum(e_i5) == sum(e_5i)
-    # Strategy: scale the smaller side up to match the larger side,
-    # using available headroom. If headroom is insufficient, scale
-    # the larger side down instead.
-    inflow_5  = sum(exchange[1:4, 5])   # flow into hub
-    outflow_5 = sum(exchange[5, 1:4])   # flow out of hub
-
-    if abs(inflow_5 - outflow_5) > 1e-8
-        if inflow_5 > outflow_5
-            # Try to scale up outflows to match inflows
-            headroom = sum(exchange_ub_mat[5, j] - exchange[5, j] for j in 1:4)
-            needed   = inflow_5 - outflow_5
-            if headroom >= needed
-                # Scale outflows up proportionally by headroom
-                for j in 1:4
-                    h = exchange_ub_mat[5, j] - exchange[5, j]
-                    exchange[5, j] += needed * h / headroom
-                end
-            else
-                # Not enough headroom — scale inflows down to match outflows + headroom
-                target = outflow_5 + headroom
-                # First max out all outflows
-                for j in 1:4
-                    exchange[5, j] = exchange_ub_mat[5, j]
-                end
-                # Then scale inflows down to target
-                if inflow_5 > 1e-8
-                    scale = target / inflow_5
-                    for i in 1:4
-                        exchange[i, 5] = clamp(exchange[i, 5] * scale,
-                                               0.0, exchange_ub_mat[i, 5])
-                    end
-                end
-            end
-        else
-            # outflow_5 > inflow_5: mirror case, scale up inflows
-            headroom = sum(exchange_ub_mat[i, 5] - exchange[i, 5] for i in 1:4)
-            needed   = outflow_5 - inflow_5
-            if headroom >= needed
-                for i in 1:4
-                    h = exchange_ub_mat[i, 5] - exchange[i, 5]
-                    exchange[i, 5] += needed * h / headroom
-                end
-            else
-                target = inflow_5 + headroom
-                for i in 1:4
-                    exchange[i, 5] = exchange_ub_mat[i, 5]
-                end
-                if outflow_5 > 1e-8
-                    scale = target / outflow_5
-                    for j in 1:4
-                        exchange[5, j] = clamp(exchange[5, j] * scale,
-                                               0.0, exchange_ub_mat[5, j])
-                    end
-                end
-            end
-        end
+    # transshipment balance: sum(ex_i5) == sum(ex_5i)
+    inflow_5 = sum(exchange[1:4, 5])
+    outflow_5 = sum(exchange[5, 1:4])
+    imbalance = inflow_5 - outflow_5
+    if outflow_5 > 1e-8
+        exchange[5, 1:4] .+= imbalance .* exchange[5, 1:4] ./ outflow_5
     end
-    # Verify: after projection, transshipment balance holds exactly
-    # (within floating point tolerance)
+    exchange = clamp.(exchange, 0.0, exchange_ub_mat)
 
     # ── Step 4: Thermal — clip each unit to [lb, ub] ──────────────
     thermal_raw = Float64.(a[9:103])
