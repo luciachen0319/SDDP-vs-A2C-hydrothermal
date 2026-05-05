@@ -7,6 +7,9 @@ using Distributions
 using LinearAlgebra
 using Plots
 using Random
+using Printf
+using Statistics
+
 
 include("save_results_sddp.jl")
 
@@ -16,7 +19,7 @@ include("save_results_sddp.jl")
 include("../shared_scenarios.jl")
 
 const N_EVAL = 100
-const EVAL_SEED = 100  # Must match the seed in A2C.jl
+const EVAL_SEED = 204 # Must match the seed in A2C.jl
 
 
 gamma = Matrix(CSV.read("../data/gamma.csv", DataFrame))[:, 2:end]
@@ -201,7 +204,7 @@ model = SDDP.LinearPolicyGraph(
 
 end
 
-SDDP.train(model,
+sddp_train_time = @elapsed SDDP.train(model,
     iteration_limit=1000,
     print_level=1,
     log_frequency=1,
@@ -246,7 +249,13 @@ simulations = SDDP.simulate(
 
 costs = [sum(stage[:stage_objective] for stage in sim) for sim in simulations]
 true_mean_cost = sum(costs) / length(costs)
-
+std_cost = std(costs)
+println("Std Dev of Simulation Cost: ", std_cost)
+println()
+println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+@printf "SDDP training time: %.2f seconds\n" sddp_train_time
+@printf "SDDP training time: %.2f minutes\n" sddp_train_time / 60
+println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 println("Final Lower Bound: ", SDDP.calculate_bound(model))
 println("True Expected Simulation Cost: ", true_mean_cost)
 
