@@ -149,14 +149,12 @@ model = SDDP.LinearPolicyGraph(
     )
 
     # Markov chain for inflows
-    if t == 1  # First stage
-        for i in 1:4
-            # In SDDP.jl, when declaring an SDDP.State with an initial_value
-            # the package automatically constraints the incoming state (.in) 
-            # to that value in the first stage
-            #@constraint(sp, inflow[i].in == inflow_initial[i])
-            #@constraint(sp, stored[i].in == stored_initial[i])
-            @constraint(sp, inflow[i].out == inflow_initial[i])
+    if t == 1  # First stage — single deterministic scenario so Historical sampler covers it
+        @constraint(sp, base_t1[i=1:4], inflow[i].out == 0.0)
+        SDDP.parameterize(sp, [inflow_initial], [1.0]) do ω
+            for i in 1:4
+                set_normalized_rhs(base_t1[i], ω[i])
+            end
         end
     else  # Other stages
         # Create base constraints
@@ -231,7 +229,10 @@ scenarios_inflow, scenarios_omega = generate_eval_scenarios(
 # (Stage 1 is deterministic, so noise starts at t=2)
 historical_sampler = SDDP.Historical(
     [
-    [(t + 1, scenarios_omega[s][t]) for t in 1:23]
+    vcat(
+        [(1, inflow_initial)],
+        [(t + 1, scenarios_omega[s][t]) for t in 1:23]
+    )
     for s in 1:N_EVAL
 ]
 )

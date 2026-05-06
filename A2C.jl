@@ -6,7 +6,7 @@ Mirrors sddp_ts.jl:
   - Thermal: economic dispatch across 95 units (exact per-unit cost)
   - Exchange: learned approximation with anti-cycling penalty
   - Deficit: single-level per subsystem (simplified for training stability)
-  - Spill: capped at 10% of storage per month
+  - Spill: non-negative, bounded only by available water after hydro (matches SDDP)
 """
 
 using Flux
@@ -70,6 +70,7 @@ exchange_cost_mat = [0.0 0.001 0.001 0.001 0.0005;   # from exchange_cost.csv
     0.0005 0.0005 0.0005 0.0005 0.0]
 
 const SPILL_COST = 0.001f0
+const MAX_INFLOW = [1000000.0, 1000000.0, 1000000.0, 1000000.0]  # matches sddp_ts.jl
 
 # ─────────────────────────────────────────────────────────────────
 # 2. INFLOW SAMPLER  (mirrors create_sampler in sddp_ts.jl)
@@ -95,7 +96,7 @@ function sample_inflow(t::Int, prev_inflow::Vector{Float64}, rng::AbstractRNG)
     coef = round.(coef, digits=4)
     rhs = round.(rhs, digits=4)
 
-    return clamp.(rhs .- coef .* prev_inflow, 0.0, Inf)
+    return clamp.(rhs .- coef .* prev_inflow, 0.0, MAX_INFLOW)
 end
 
 # ─────────────────────────────────────────────────────────────────
@@ -282,9 +283,11 @@ function env_step!(env::HydrothermalEnv, raw_action::Vector{Float32})
 
     # ── Step 2: Spill — enforce hydrological balance ───────────────
     # v_it = v_{i,t-1} + a_it - q_it - s_it
-    # mandatory spill to prevent overflow + optional network spill
-    spill_mandatory = max.(avail_water .- hydro_gen .- stored_ub, 0.0)
-    spill_optional = Float64.(a[5:8]) .* env.stored .* 0.1
+    # spill >= 0 with no upper cap (matches SDDP); agent controls fraction of spillable water
+    max_spillable = avail_water .- hydro_gen
+    spill_mandatory = max.(max_spillable .- stored_ub, 0.0)
+    spill_capacity = max.(max_spillable .- spill_mandatory, 0.0)
+    spill_optional = Float64.(a[5:8]) .* spill_capacity
     spill = spill_mandatory .+ spill_optional
     # hydrological balance satisfied exactly:
     new_stored = clamp.(avail_water .- hydro_gen .- spill, 0.0, stored_ub)
@@ -703,8 +706,10 @@ function evaluate_detailed(agent; n_episodes=5, seed=100)
             avail_water = env.stored .+ env.inflow
             hydro = Float64.(a[1:4]) .* min.(hydro_gen_ub, avail_water)
 
-            spill_mandatory = max.(avail_water .- hydro .- stored_ub, 0.0)
-            spill_optional = Float64.(a[5:8]) .* env.stored .* 0.1
+            max_spillable = avail_water .- hydro
+            spill_mandatory = max.(max_spillable .- stored_ub, 0.0)
+            spill_capacity = max.(max_spillable .- spill_mandatory, 0.0)
+            spill_optional = Float64.(a[5:8]) .* spill_capacity
             spill = spill_mandatory .+ spill_optional
 
             thermal_raw = Float64.(a[9:8+N_THERMAL_TOTAL])
@@ -782,9 +787,9 @@ end
 
 const SDDP_DATA_PATH = joinpath(@__DIR__, "output/simulations/sddp_train/ts/")
 const N_SDDP_SIMULATIONS = 100
-# SDDP.jl records one entry per stochastic stage; the deterministic first stage
-# is not separately returned, so each simulation has 23 saved stages (SDDP stages 2-24).
-const SDDP_HORIZON = 23
+# sddp_ts.jl now parameterizes stage 1 with a single fixed scenario so the
+# Historical sampler covers all 24 stages; each simulation has 24 saved stages.
+const SDDP_HORIZON = 24
 
 """
     load_sddp_data(base_path::String, num_simulations::Int, horizon::Int)
@@ -857,9 +862,13 @@ function load_sddp_data(base_path::String, num_simulations::Int, horizon::Int)
 
             # --- Normalize values to [0,1] for A2C actions ---
             # We map actual generation to fractions based on the bounds defined in constants
-            avail_water = current_stored .+ current_inflow
+            avail_water = Float64.(current_stored) .+ val_inflow
             a_hydro = Float32.(val_hydro ./ max.(1.0, min.(hydro_gen_ub, avail_water)))
-            a_spill = Float32.(val_spill ./ max.(1.0, current_stored .* 0.1))
+            # spill normalisation mirrors env_step!: optional fraction of spillable capacity
+            max_spillable_l = avail_water .- val_hydro          # = next_stored + val_spill
+            spill_mandatory_l = max.(max_spillable_l .- stored_ub, 0.0)
+            spill_capacity_l = max.(max_spillable_l .- spill_mandatory_l, 0.0)
+            a_spill = Float32.((val_spill .- spill_mandatory_l) ./ max.(1.0, spill_capacity_l))
             a_thermal = Float32.((val_thermal .- thermal_unit_lb) ./ max.(1.0, thermal_unit_ub .- thermal_unit_lb))
 
             # Deficit and Exchange normalization
